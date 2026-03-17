@@ -1,0 +1,319 @@
+version: 2
+
+# ===========================================================================
+# SOURCES — Bronze Delta tables registered in Hive Metastore by the notebooks.
+# The notebooks run CREATE TABLE IF NOT EXISTS default.bronze_weather / bronze_energy
+# after each write, making them queryable here as dbt sources.
+# ===========================================================================
+sources:
+  - name: bronze
+    description: "Raw ingestion layer — Delta tables written by PySpark notebooks."
+    database: hive_metastore   # Databricks default catalog
+    schema: default
+    tables:
+      - name: bronze_weather
+        description: "Raw hourly weather data from Open-Meteo. Partitioned by country, ingested_date."
+        columns:
+          - name: city
+            description: "City name (e.g. London)"
+            tests:
+              - not_null
+          - name: country
+            description: "ISO 2-letter country code"
+            tests:
+              - not_null
+          - name: hour
+            description: "Observation timestamp (UTC)"
+            tests:
+              - not_null
+          - name: source
+            description: "Source system identifier — always 'open_meteo'"
+            tests:
+              - not_null
+
+      - name: bronze_energy
+        description: >
+          Raw energy readings from two free sources:
+          UK Carbon Intensity API (GB/London) and SMARD (DE/Berlin, AT/Vienna).
+          FR, ES, IT, NL, PL, SE, PT rows absent until ENTSO-E access is granted.
+          Partitioned by country, ingested_date.
+        columns:
+          - name: zone
+            description: "Electricity zone code (e.g. DE, GB, AT)"
+            tests:
+              - not_null
+          - name: country
+            description: "ISO 2-letter country code"
+            tests:
+              - not_null
+          - name: ingested_at
+            description: "UTC timestamp when the row was written to Bronze"
+            tests:
+              - not_null
+          - name: source
+            description: "Source system identifier — 'uk_carbon_intensity' or 'smard'"
+            tests:
+              - not_null
+          - name: day_ahead_price_eur_mwh
+            description: "Day-ahead electricity price in EUR/MWh — populated by SMARD for DE and AT, null for GB"
+
+# ===========================================================================
+# MODELS
+# ===========================================================================
+models:
+
+  # -------------------------------------------------------------------------
+  # SILVER
+  # -------------------------------------------------------------------------
+  - name: stg_weather_hourly
+    description: >
+      Cleaned, typed, and deduplicated hourly weather observations.
+      Grain: one row per city per hour. Incremental — merges on weather_id.
+    columns:
+      - name: weather_id
+        description: "SHA-256 surrogate key: SHA2(city || observation_hour)"
+        tests:
+          - not_null
+          - unique
+      - name: city
+        description: "City name"
+        tests:
+          - not_null
+      - name: country
+        description: "ISO 2-letter country code"
+        tests:
+          - not_null
+      - name: observation_hour
+        description: "Truncated-to-hour observation timestamp (UTC)"
+        tests:
+          - not_null
+      - name: temperature_2m
+        description: "Air temperature at 2m above ground (°C)"
+        tests:
+          - not_null
+      - name: weathercode
+        description: "WMO weather interpretation code"
+      - name: windspeed_10m
+        description: "Wind speed at 10m above ground (km/h)"
+      - name: precipitation
+        description: "Total precipitation for the hour (mm)"
+      - name: _source
+        description: "Source system name"
+        tests:
+          - not_null
+      - name: _ingested_at
+        description: "When the row arrived in Bronze"
+        tests:
+          - not_null
+      - name: _loaded_at
+        description: "When this Silver model ran"
+        tests:
+          - not_null
+
+  - name: stg_energy_intensity
+    description: >
+      Cleaned carbon intensity and renewable percentage readings per electricity zone.
+      Grain: one row per zone per measurement hour. Incremental — merges on energy_id.
+    columns:
+      - name: energy_id
+        description: "SHA-256 surrogate key: SHA2(zone || ingested_at)"
+        tests:
+          - not_null
+          - unique
+      - name: zone
+        description: "Electricity Maps zone code"
+        tests:
+          - not_null
+      - name: country
+        description: "ISO 2-letter country code"
+        tests:
+          - not_null
+      - name: city
+        description: "Primary city associated with this zone"
+        tests:
+          - not_null
+      - name: carbon_intensity_gco2eq
+        description: "Carbon intensity in gCO2eq per kWh"
+      - name: fossil_free_pct
+        description: "Percentage of electricity from fossil-free sources (0–100)"
+      - name: renewable_pct
+        description: "Percentage of electricity from renewable sources (0–100)"
+      - name: day_ahead_price_eur_mwh
+        description: "Day-ahead electricity price in EUR/MWh — populated for DE and AT from SMARD, null for GB"
+      - name: measurement_hour
+        description: "Hour of the carbon intensity measurement (UTC)"
+      - name: _source
+        description: "Source system name"
+        tests:
+          - not_null
+      - name: _ingested_at
+        description: "When the row arrived in Bronze"
+        tests:
+          - not_null
+      - name: _loaded_at
+        description: "When this Silver model ran"
+        tests:
+          - not_null
+
+  # -------------------------------------------------------------------------
+  # GOLD — Dimensions
+  # -------------------------------------------------------------------------
+  - name: dim_location
+    description: >
+      City/region dimension with SCD Type 2 history, sourced from the snap_dim_location snapshot.
+      Only current records (dbt_is_current = true) are exposed here.
+    columns:
+      - name: location_key
+        description: "SHA-256 surrogate key based on city name"
+        tests:
+          - not_null
+          - unique
+      - name: city
+        description: "City name"
+        tests:
+          - not_null
+      - name: country
+        description: "ISO 2-letter country code"
+        tests:
+          - not_null
+      - name: electricity_zone
+        description: "Electricity Maps zone code used to join with energy data"
+        tests:
+          - not_null
+
+  - name: dim_time
+    description: >
+      Date/time dimension covering 2024-01-01 to 2025-12-31 at hourly granularity.
+      Generated via Spark SQL sequence() — no upstream data dependency.
+    columns:
+      - name: time_key
+        description: "Natural key in yyyyMMddHH format (e.g. 2024011512)"
+        tests:
+          - not_null
+          - unique
+      - name: full_timestamp
+        description: "Full UTC timestamp"
+        tests:
+          - not_null
+      - name: year
+        tests:
+          - not_null
+      - name: month
+        tests:
+          - not_null
+      - name: day
+        tests:
+          - not_null
+      - name: hour
+        tests:
+          - not_null
+      - name: is_weekend
+        description: "True if Saturday or Sunday"
+        tests:
+          - not_null
+
+  - name: dim_weather_condition
+    description: >
+      Lookup table mapping WMO 4677 weather codes to human-readable labels,
+      categories, and severity levels. Static — no upstream dependency.
+    columns:
+      - name: weathercode
+        description: "WMO 4677 integer code (natural key)"
+        tests:
+          - not_null
+          - unique
+      - name: condition_label
+        description: "Human-readable label (e.g. 'Partly Cloudy')"
+        tests:
+          - not_null
+      - name: condition_category
+        description: "Broad category: sunny | cloudy | rainy | snowy | foggy | stormy"
+        tests:
+          - not_null
+          - accepted_values:
+              values: [sunny, cloudy, rainy, snowy, foggy, stormy]
+      - name: severity
+        description: "Severity level: mild | moderate | severe"
+        tests:
+          - not_null
+          - accepted_values:
+              values: [mild, moderate, severe]
+
+  # -------------------------------------------------------------------------
+  # GOLD — Facts & Aggregates
+  # -------------------------------------------------------------------------
+  - name: fact_energy_readings
+    description: >
+      Central fact table. Grain: one row per city per hour.
+      Joins weather observations with energy readings via location and time dimensions.
+    columns:
+      - name: fact_id
+        description: "SHA-256 surrogate key: SHA2(city || observation_hour)"
+        tests:
+          - not_null
+          - unique
+      - name: location_key
+        description: "FK → dim_location.location_key"
+        tests:
+          - not_null
+      - name: time_key
+        description: "FK → dim_time.time_key"
+        tests:
+          - not_null
+      - name: temperature_2m
+        description: "Air temperature at 2m (°C)"
+      - name: carbon_intensity
+        description: "Carbon intensity in gCO2eq/kWh at time of reading"
+      - name: renewable_pct
+        description: "Renewable energy percentage at time of reading"
+      - name: day_ahead_price_eur_mwh
+        description: "Day-ahead electricity price in EUR/MWh — available for DE and AT only until ENTSO-E connected"
+
+  - name: agg_daily_energy
+    description: >
+      Daily aggregates per city — average, min, max temperature; total precipitation;
+      average carbon intensity and renewable percentage.
+    columns:
+      - name: agg_date
+        description: "Aggregation date"
+        tests:
+          - not_null
+      - name: city
+        description: "City name"
+        tests:
+          - not_null
+
+  - name: rpt_weather_energy_correlation
+    description: >
+      Monthly cross-domain correlation report linking average temperature to
+      average carbon intensity per city. Supports analytical storytelling.
+    columns:
+      - name: city
+        tests:
+          - not_null
+      - name: country
+        tests:
+          - not_null
+      - name: year
+        tests:
+          - not_null
+      - name: month
+        tests:
+          - not_null
+
+# ===========================================================================
+# SNAPSHOTS
+# ===========================================================================
+snapshots:
+  - name: snap_dim_location
+    description: >
+      SCD Type 2 snapshot of the regions seed. Tracks historical changes to
+      city metadata (lat, lon, timezone, electricity_zone).
+    columns:
+      - name: city
+        tests:
+          - not_null
+      - name: dbt_scd_id
+        tests:
+          - not_null
+          - unique

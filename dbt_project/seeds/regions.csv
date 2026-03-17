@@ -1,0 +1,11 @@
+city,country,latitude,longitude,timezone,electricity_zone
+London,GB,51.5074,-0.1278,Europe/London,GB
+Berlin,DE,52.5200,13.4050,Europe/Berlin,DE
+Paris,FR,48.8566,2.3522,Europe/Paris,FR
+Madrid,ES,40.4168,-3.7038,Europe/Madrid,ES
+Rome,IT,41.9028,12.4964,Europe/Rome,IT
+Amsterdam,NL,52.3676,4.9041,Europe/Amsterdam,NL
+Warsaw,PL,52.2297,21.0122,Europe/Warsaw,PL
+Vienna,AT,48.2082,16.3738,Europe/Vienna,AT
+Stockholm,SE,59.3293,18.0686,Europe/Stockholm,SE
+Lisbon,PT,38.7169,-9.1399,Europe/Lisbon,PT

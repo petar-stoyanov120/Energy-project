@@ -1,0 +1,13 @@
+# dbt build artefacts
+target/
+dbt_packages/
+logs/
+
+# Credentials — NEVER commit
+profiles.yml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env

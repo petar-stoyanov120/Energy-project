@@ -1,0 +1,50 @@
+name: weather_energy
+version: "1.0.0"
+config-version: 2
+
+profile: weather_energy
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+snapshot-paths: ["snapshots"]
+test-paths: ["tests"]
+analysis-paths: ["analyses"]
+macro-paths: ["macros"]
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+vars:
+  # Lower bound for incremental model backfill. Override with --vars '{"start_date": "2024-01-01"}'
+  start_date: "2024-01-01"
+
+models:
+  weather_energy:
+    silver:
+      +materialized: incremental
+      +incremental_strategy: merge
+      +on_schema_change: sync_all_columns
+    gold:
+      +materialized: table
+      dim_time:
+        +materialized: table
+      dim_weather_condition:
+        +materialized: table
+      dim_location:
+        +materialized: table
+      agg_daily_energy:
+        +materialized: table
+      rpt_weather_energy_correlation:
+        +materialized: table
+      fact_energy_readings:
+        +materialized: incremental
+        +incremental_strategy: merge
+        +on_schema_change: sync_all_columns
+
+seeds:
+  weather_energy:
+    regions:
+      +column_types:
+        latitude: float
+        longitude: float
