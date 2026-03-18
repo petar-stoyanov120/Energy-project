@@ -4,7 +4,7 @@
 # MAGIC
 # MAGIC Runs the Bronze ingestion notebooks in sequence with idempotency protection.
 # MAGIC
-# MAGIC **Idempotency guard:** Checks the audit log for a `RUNNING` status from the
+# MAGIC **Idempotency guard:** Checks the pipeline run log for a `RUNNING` status from the
 # MAGIC last 2 hours before starting. If one exists, the run is aborted to prevent
 # MAGIC concurrent duplicate runs (e.g. if triggered twice by accident).
 # MAGIC
@@ -12,9 +12,18 @@
 # MAGIC 1. `01_bronze_weather.py` — ~1 minute (Open-Meteo, 10 cities)
 # MAGIC 2. `02_bronze_energy.py` — ~1 minute (UK Carbon Intensity + SMARD, no rate limiting)
 # MAGIC
-# MAGIC **Timeouts:**
-# MAGIC - Weather notebook: 300 seconds (5 minutes)
-# MAGIC - Energy notebook:  300 seconds (5 minutes — no rate-limit sleep needed)
+# MAGIC **Note:** `%run` is used instead of `dbutils.notebook.run()` — the latter is not
+# MAGIC supported on Databricks Free Edition serverless compute.
+
+# COMMAND ----------
+# Runtime configuration — set catalog and schema in the widget bar before running.
+# Sub-notebooks (01, 02) define the same widgets with the same defaults, so they
+# will use the correct Unity Catalog location automatically when %run'd.
+dbutils.widgets.text("catalog", "main")
+dbutils.widgets.text("schema",  "weather_energy_dev")
+
+CATALOG: str = dbutils.widgets.get("catalog")
+SCHEMA:  str = dbutils.widgets.get("schema")
 
 # COMMAND ----------
 
@@ -24,23 +33,11 @@ from datetime import datetime, timedelta
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, lit
 from pyspark.sql.types import (
-    IntegerType,
     StringType,
     StructField,
     StructType,
     TimestampType,
 )
-
-# --------------------------------------------------------------------------- #
-# Constants
-# --------------------------------------------------------------------------- #
-AUDIT_LOG_PATH: str = "dbfs:/delta/logs/bronze_audit"
-RUN_LOG_PATH:   str = "dbfs:/delta/logs/pipeline_runs"
-
-WEATHER_NOTEBOOK:  str = "./01_bronze_weather"
-ENERGY_NOTEBOOK:   str = "./02_bronze_energy"
-WEATHER_TIMEOUT:   int = 300   # seconds
-ENERGY_TIMEOUT:    int = 300   # seconds — UK Carbon Intensity + SMARD have no rate-limit sleep
 
 # How far back to look when checking for a concurrent RUNNING status.
 RUNNING_CHECK_WINDOW_HOURS: int = 2
@@ -55,7 +52,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
-# Run log schema — separate from bronze_audit; tracks orchestrator-level runs.
+# Run log schema — tracks orchestrator-level runs.
 # --------------------------------------------------------------------------- #
 RUN_LOG_SCHEMA = StructType([
     StructField("run_id",     StringType(),    nullable=False),
@@ -75,7 +72,7 @@ def is_pipeline_running(spark: SparkSession) -> bool:
     Prevents concurrent or double-triggered runs from corrupting Bronze tables.
     """
     try:
-        df = spark.read.format("delta").load(RUN_LOG_PATH)
+        df = spark.table(f"{CATALOG}.{SCHEMA}.pipeline_run_log")
         cutoff = datetime.utcnow() - timedelta(hours=RUNNING_CHECK_WINDOW_HOURS)
         running_count = (
             df.filter(
@@ -93,7 +90,7 @@ def write_run_status(
     spark: SparkSession, run_id: str, started_at: datetime,
     status: str, ended_at: datetime = None, error: str = None
 ) -> None:
-    """Append or update the orchestrator run log."""
+    """Append a row to the orchestrator run log managed table."""
     row = [{
         "run_id":     run_id,
         "started_at": started_at,
@@ -102,57 +99,38 @@ def write_run_status(
         "error":      error,
     }]
     df = spark.createDataFrame(row, schema=RUN_LOG_SCHEMA)
-    df.write.format("delta").mode("append").save(RUN_LOG_PATH)
+    df.write.format("delta").mode("append").saveAsTable(f"{CATALOG}.{SCHEMA}.pipeline_run_log")
 
+# COMMAND ----------
+# --- Orchestration start: idempotency check + mark RUNNING ---
 
-# --------------------------------------------------------------------------- #
-# Main execution
-# --------------------------------------------------------------------------- #
+spark      = SparkSession.builder.getOrCreate()
+started_at = datetime.utcnow()
+run_id     = started_at.strftime("%Y%m%d_%H%M%S")
 
-def main() -> None:
-    """Run the full Bronze ingestion pipeline with idempotency and audit logging."""
-    spark = SparkSession.builder.getOrCreate()
-    started_at = datetime.utcnow()
-    run_id = started_at.strftime("%Y%m%d_%H%M%S")
+logger.info(f"Orchestrator starting. run_id={run_id}")
 
-    logger.info(f"Orchestrator starting. run_id={run_id}")
+if is_pipeline_running(spark):
+    msg = (
+        f"A pipeline run is already in RUNNING status within the last "
+        f"{RUNNING_CHECK_WINDOW_HOURS}h. Aborting to prevent duplicate ingestion."
+    )
+    logger.error(msg)
+    raise RuntimeError(msg)
 
-    # --- Idempotency guard ---------------------------------------------------
-    if is_pipeline_running(spark):
-        msg = (
-            f"A pipeline run is already in RUNNING status within the last "
-            f"{RUNNING_CHECK_WINDOW_HOURS}h. Aborting to prevent duplicate ingestion."
-        )
-        logger.error(msg)
-        raise RuntimeError(msg)
+write_run_status(spark, run_id, started_at, status="RUNNING")
+logger.info(f"Marked run {run_id} as RUNNING.")
 
-    # Mark this run as RUNNING before executing any notebooks.
-    write_run_status(spark, run_id, started_at, status="RUNNING")
+# COMMAND ----------
+# MAGIC %run ./01_bronze_weather
 
-    try:
-        # --- Step 1: Weather ingestion ---------------------------------------
-        logger.info(f"Running {WEATHER_NOTEBOOK} (timeout={WEATHER_TIMEOUT}s)...")
-        dbutils.notebook.run(WEATHER_NOTEBOOK, timeout_seconds=WEATHER_TIMEOUT)
-        logger.info("Weather notebook completed successfully.")
+# COMMAND ----------
+# MAGIC %run ./02_bronze_energy
 
-        # --- Step 2: Energy ingestion ----------------------------------------
-        logger.info(f"Running {ENERGY_NOTEBOOK} (timeout={ENERGY_TIMEOUT}s)...")
-        logger.info("Sources: UK Carbon Intensity API (GB) + SMARD (DE, AT). No rate-limit sleep.")
-        dbutils.notebook.run(ENERGY_NOTEBOOK, timeout_seconds=ENERGY_TIMEOUT)
-        logger.info("Energy notebook completed successfully.")
+# COMMAND ----------
+# --- Mark pipeline as SUCCESS ---
 
-        # --- Mark success ----------------------------------------------------
-        ended_at = datetime.utcnow()
-        write_run_status(spark, run_id, started_at, status="SUCCESS", ended_at=ended_at)
-        duration_min = (ended_at - started_at).seconds // 60
-        logger.info(f"Pipeline completed successfully in ~{duration_min} minutes. run_id={run_id}")
-
-    except Exception as exc:
-        ended_at = datetime.utcnow()
-        error_msg = str(exc)
-        logger.error(f"Pipeline FAILED: {error_msg}")
-        write_run_status(spark, run_id, started_at, status="FAILED", ended_at=ended_at, error=error_msg)
-        raise
-
-
-main()
+ended_at     = datetime.utcnow()
+duration_min = (ended_at - started_at).seconds // 60
+write_run_status(spark, run_id, started_at, status="SUCCESS", ended_at=ended_at)
+logger.info(f"Pipeline completed successfully in ~{duration_min} minutes. run_id={run_id}")

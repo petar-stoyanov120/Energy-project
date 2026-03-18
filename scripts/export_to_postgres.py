@@ -159,7 +159,7 @@ def read_gold_table(spark: SparkSession, table_name: str) -> pd.DataFrame:
 
     Reads from the Hive Metastore table registered by dbt under DBT_SCHEMA.
     """
-    full_table = f"`{DBT_SCHEMA}`.`{table_name}`"
+    full_table = f"main.{DBT_SCHEMA}.{table_name}"
     logger.info(f"Reading {full_table} from Databricks...")
     df_spark = spark.table(full_table)
     row_count = df_spark.count()

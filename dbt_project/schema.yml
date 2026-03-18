@@ -8,8 +8,8 @@ version: 2
 sources:
   - name: bronze
     description: "Raw ingestion layer — Delta tables written by PySpark notebooks."
-    database: hive_metastore   # Databricks default catalog
-    schema: default
+    database: main              # Unity Catalog (Free Edition serverless)
+    schema: weather_energy_dev
     tables:
       - name: bronze_weather
         description: "Raw hourly weather data from Open-Meteo. Partitioned by country, ingested_date."

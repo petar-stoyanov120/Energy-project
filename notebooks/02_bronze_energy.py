@@ -15,7 +15,16 @@
 # MAGIC **No API keys required.** Both sources are completely free and open.
 # MAGIC
 # MAGIC **Idempotent:** Re-running on the same day overwrites only today's partition.
-# MAGIC **Audited:** Every run appends rows to `dbfs:/delta/logs/bronze_audit/`.
+# MAGIC **Audited:** Every run appends rows to the `bronze_audit` managed table.
+
+# COMMAND ----------
+# Runtime configuration — set catalog and schema in the widget bar before running.
+# Defaults match the standard Unity Catalog layout for this project.
+dbutils.widgets.text("catalog", "main")
+dbutils.widgets.text("schema",  "weather_energy_dev")
+
+CATALOG: str = dbutils.widgets.get("catalog")
+SCHEMA:  str = dbutils.widgets.get("schema")
 
 # COMMAND ----------
 
@@ -41,8 +50,6 @@ from pyspark.sql.types import (
 # --------------------------------------------------------------------------- #
 MAX_RETRIES: int = 3
 TIMEOUT_SECONDS: int = 30
-BRONZE_ENERGY_PATH: str = "dbfs:/delta/bronze/energy"
-AUDIT_LOG_PATH: str = "dbfs:/delta/logs/bronze_audit"
 PARTITION_COLS: list[str] = ["country", "ingested_date"]
 
 # UK Carbon Intensity API — no auth, completely free.
@@ -252,26 +259,17 @@ def write_bronze_energy(spark: SparkSession, rows: list[dict], ingested_date: da
     df = spark.createDataFrame(rows, schema=ENERGY_SCHEMA)
     row_count = df.count()
 
+    target_table = f"{CATALOG}.{SCHEMA}.bronze_energy"
     (
         df.write
         .format("delta")
         .mode("overwrite")
         .option("replaceWhere", f"ingested_date = '{ingested_date}'")
         .partitionBy(*PARTITION_COLS)
-        .save(BRONZE_ENERGY_PATH)
+        .saveAsTable(target_table)
     )
-    logger.info(f"Wrote {row_count} rows to {BRONZE_ENERGY_PATH}")
+    logger.info(f"Wrote {row_count} rows to {target_table}")
     return row_count
-
-
-def register_hive_table(spark: SparkSession) -> None:
-    """Register the Delta table in the Hive Metastore so dbt sources can query it by name."""
-    spark.sql(f"""
-        CREATE TABLE IF NOT EXISTS default.bronze_energy
-        USING DELTA
-        LOCATION '{BRONZE_ENERGY_PATH}'
-    """)
-    logger.info("Registered default.bronze_energy in Hive Metastore")
 
 
 def write_audit_row(
@@ -297,7 +295,7 @@ def write_audit_row(
         audit_df.write
         .format("delta")
         .mode("append")
-        .save(AUDIT_LOG_PATH)
+        .saveAsTable(f"{CATALOG}.{SCHEMA}.bronze_audit")
     )
 
 # --------------------------------------------------------------------------- #
@@ -363,7 +361,6 @@ def main() -> None:
         raise RuntimeError("No rows collected from any zone — aborting Bronze write.")
 
     total_rows = write_bronze_energy(spark, all_rows, ingested_date)
-    register_hive_table(spark)
 
     write_audit_row(spark, "ALL_ZONES", total_rows, ingested_at, "SUCCESS")
     logger.info(f"Energy ingestion complete. Total rows written: {total_rows}")

@@ -12,29 +12,25 @@ Star schema gold layer · Cross-domain analytics (weather ↔ energy correlation
 ---
 
 ## 2. Tech Stack
-- **Runtime:** Databricks Free Edition (x2.small fixed cluster — no customization)
-- **Compute:** PySpark 3.x + Spark SQL
+- **Runtime:** Databricks Free Edition — serverless compute only (Databricks Runtime 18.0, Python 3.12, Spark Connect)
+- **Compute:** PySpark (Spark Connect API) + Spark SQL — no `sparkContext`, no RDD, no `df.cache()`
 - **Transformation:** dbt Core (dbt-databricks adapter) in VS Code
-- **Storage:** Delta Lake on native DBFS (`dbfs:/delta/bronze/`, `dbfs:/delta/silver/`, `dbfs:/delta/gold/`)
+- **Storage:** Delta Lake as Unity Catalog managed tables (`main.weather_energy_dev.*`) — no DBFS paths
 - **Serving DB:** PostgreSQL (local)
 - **BI:** Metabase standalone JAR (free, no Docker required)
-- **APIs:** Open-Meteo (no auth) · Electricity Maps (free tier, API key required)
-- **Secrets:** Databricks `dbutils.secrets` — never hardcoded
+- **APIs:** Open-Meteo (no auth) · UK Carbon Intensity API (no auth) · SMARD (no auth)
+- **Config:** Databricks Widgets (`dbutils.widgets`) for catalog, schema, and API keys at runtime
 - **Version control:** GitHub repo connected to Databricks workspace
-
-> **Storage fallback:** If `dbfs:/delta/` paths are inaccessible, fall back to Unity Catalog
-> managed volumes (`/Volumes/<catalog>/<schema>/<volume>/`) or managed Delta tables registered
-> directly in the Hive Metastore without an explicit LOCATION clause.
 
 ---
 
 ## 3. Architecture Overview
 
 ```
-APIs (Open-Meteo, Electricity Maps)
-        ↓  PySpark notebooks
-  BRONZE — raw JSON → Delta Lake on DBFS (partitioned by country, ingested_date)
-        ↓  dbt + PySpark
+APIs (Open-Meteo, UK Carbon Intensity, SMARD)
+        ↓  PySpark notebooks (serverless)
+  BRONZE — managed Delta tables in Unity Catalog (partitioned by country, ingested_date)
+        ↓  dbt + Spark SQL
   SILVER — cleaned, typed, deduped, SCD2 dims
         ↓  dbt models + Spark SQL
   GOLD   — star schema (fact_energy_readings, dim_location, dim_time, dim_weather_condition)
@@ -42,13 +38,14 @@ APIs (Open-Meteo, Electricity Maps)
   SERVING — PostgreSQL → Metabase
 ```
 
-**Storage paths:**
+**Managed table names (Unity Catalog):**
 ```
-dbfs:/delta/bronze/weather/     partitioned by country, ingested_date
-dbfs:/delta/bronze/energy/      partitioned by country, ingested_date
-dbfs:/delta/silver/             managed by dbt
-dbfs:/delta/gold/               managed by dbt
-dbfs:/delta/logs/bronze_audit/  audit log (unpartitioned)
+main.weather_energy_dev.bronze_weather     partitioned by country, ingested_date
+main.weather_energy_dev.bronze_energy      partitioned by country, ingested_date
+main.weather_energy_dev.bronze_audit       audit log
+main.weather_energy_dev.pipeline_run_log   orchestrator run log
+main.weather_energy_dev.stg_*             silver — managed by dbt
+main.weather_energy_dev.dim_*, fact_*, agg_*, rpt_*  gold — managed by dbt
 ```
 
 **Folder structure:**
@@ -92,7 +89,7 @@ weather_energy_project/
 - **Logging:** Use Python `logging` module — log ingestion start, row count, duration, errors
 - **Type hints:** Required on all function signatures — `def get_weather(city: str, lat: float) -> dict:`
 - **Comments:** Explain WHY, not WHAT. One-line docstring on every function.
-- **Secrets:** Always `dbutils.secrets.get(scope="weather_energy", key="<key>")` — zero exceptions
+- **Config/Secrets:** Use `dbutils.widgets` for runtime config (catalog, schema, API keys) — never hardcode
 
 ---
 
@@ -111,11 +108,11 @@ weather_energy_project/
 /dbt-docs        → dbt docs generate && dbt docs serve
 
 # Validation
-/audit           → SELECT * FROM default.bronze_audit ORDER BY ingested_at DESC LIMIT 20
+/audit           → SELECT * FROM main.weather_energy_dev.bronze_audit ORDER BY ingested_at DESC LIMIT 20
 /row-counts      → Run row count check across all three layers
-                   Bronze: spark.read.format("delta").load("dbfs:/delta/bronze/weather").count()
-                   Silver: SELECT COUNT(*) FROM weather_energy_dev.stg_weather_hourly
-                   Gold:   SELECT COUNT(*) FROM weather_energy_dev.fact_energy_readings
+                   Bronze: SELECT COUNT(*) FROM main.weather_energy_dev.bronze_weather
+                   Silver: SELECT COUNT(*) FROM main.weather_energy_dev.stg_weather_hourly
+                   Gold:   SELECT COUNT(*) FROM main.weather_energy_dev.fact_energy_readings
 
 # Maintenance
 /clear-bronze    → TRUNCATE bronze layer — requires explicit confirmation first
@@ -143,16 +140,19 @@ weather_energy_project/
 - Never hardcode date filters — always use `{{ var('start_date') }}` or `is_incremental()` macro
 
 **API / ingestion:**
-- Never call Electricity Maps API more than 1 request/min (free tier rate limit)
 - Never ingest without writing a row to `bronze_audit` (columns: `source`, `city`, `row_count`, `ingested_at`, `status`)
 - Never skip schema enforcement with `StructType` on Bronze writes
+- If Electricity Maps API key is added later: never call more than 1 request/min (free tier rate limit); pass key via widget
 
 **Infrastructure:**
 - Never use Azure services (ADF, ADLS, AKS) — Databricks Free Edition only
-- Never use `/mnt/` paths — always use native `dbfs:/delta/` paths (or managed volumes as fallback)
+- Never use `dbfs:/delta/` paths — use `saveAsTable()` with Unity Catalog three-part names (`main.schema.table`)
+- Never use `dbutils.notebook.run()` — use `%run` magic command in a separate notebook cell instead
+- Never use `spark.sparkContext` or RDD APIs — Free Edition serverless is Spark Connect only
+- Never call `df.cache()` or `df.persist()` — raises an exception on serverless compute
 - Never attempt to mount external storage (Azure ADLS, S3, GCS) — not supported on Free Edition
 - Never run orchestrator if previous run status in run log is `RUNNING` (implement idempotency)
-- Never write files outside `dbfs:/delta/bronze/`, `dbfs:/delta/silver/`, `dbfs:/delta/gold/`, `dbfs:/delta/logs/`
+- Never register tables via `CREATE TABLE ... LOCATION` — use `saveAsTable()` which auto-registers in Unity Catalog
 
 ---
 

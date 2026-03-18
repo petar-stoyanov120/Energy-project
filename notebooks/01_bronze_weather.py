@@ -3,10 +3,19 @@
 # MAGIC # 01 — Bronze: Open-Meteo Weather Ingestion
 # MAGIC
 # MAGIC Fetches hourly weather data for 10 European capitals from the Open-Meteo API
-# MAGIC and writes raw records to Delta Lake at `dbfs:/delta/bronze/weather/`.
+# MAGIC and writes raw records to a managed Delta table in Unity Catalog.
 # MAGIC
 # MAGIC **Idempotent:** Re-running on the same day overwrites only today's partition.
-# MAGIC **Audited:** Every run writes a row to `dbfs:/delta/logs/bronze_audit/`.
+# MAGIC **Audited:** Every run writes a row to the `bronze_audit` managed table.
+
+# COMMAND ----------
+# Runtime configuration — set catalog and schema in the widget bar before running.
+# Defaults match the standard Unity Catalog layout for this project.
+dbutils.widgets.text("catalog", "main")
+dbutils.widgets.text("schema",  "weather_energy_dev")
+
+CATALOG: str = dbutils.widgets.get("catalog")
+SCHEMA:  str = dbutils.widgets.get("schema")
 
 # COMMAND ----------
 
@@ -32,8 +41,6 @@ from pyspark.sql.types import (
 # --------------------------------------------------------------------------- #
 MAX_RETRIES: int = 3
 TIMEOUT_SECONDS: int = 30
-BRONZE_WEATHER_PATH: str = "dbfs:/delta/bronze/weather"
-AUDIT_LOG_PATH: str = "dbfs:/delta/logs/bronze_audit"
 PARTITION_COLS: list[str] = ["country", "ingested_date"]
 
 # Open-Meteo requires no authentication — completely free.
@@ -169,26 +176,17 @@ def write_bronze_weather(spark: SparkSession, rows: list[dict], ingested_date: d
 
     # replaceWhere overwrites only today's partition — all other dates are untouched.
     # This makes the notebook safe to re-run on the same day without duplicating data.
+    target_table = f"{CATALOG}.{SCHEMA}.bronze_weather"
     (
         df.write
         .format("delta")
         .mode("overwrite")
         .option("replaceWhere", f"ingested_date = '{ingested_date}'")
         .partitionBy(*PARTITION_COLS)
-        .save(BRONZE_WEATHER_PATH)
+        .saveAsTable(target_table)
     )
-    logger.info(f"Wrote {row_count} rows to {BRONZE_WEATHER_PATH}")
+    logger.info(f"Wrote {row_count} rows to {target_table}")
     return row_count
-
-
-def register_hive_table(spark: SparkSession) -> None:
-    """Register the Delta table in the Hive Metastore so dbt sources can query it by name."""
-    spark.sql(f"""
-        CREATE TABLE IF NOT EXISTS default.bronze_weather
-        USING DELTA
-        LOCATION '{BRONZE_WEATHER_PATH}'
-    """)
-    logger.info("Registered default.bronze_weather in Hive Metastore")
 
 
 def write_audit_row(
@@ -213,7 +211,7 @@ def write_audit_row(
         audit_df.write
         .format("delta")
         .mode("append")
-        .save(AUDIT_LOG_PATH)
+        .saveAsTable(f"{CATALOG}.{SCHEMA}.bronze_audit")
     )
 
 
@@ -259,7 +257,6 @@ def main() -> None:
         raise RuntimeError("No rows collected from any city — aborting Bronze write.")
 
     total_rows = write_bronze_weather(spark, all_rows, ingested_date)
-    register_hive_table(spark)
 
     # Write a summary audit row for the full run.
     write_audit_row(spark, "ALL_CITIES", total_rows, ingested_at, "SUCCESS")
