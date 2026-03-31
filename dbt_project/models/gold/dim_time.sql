@@ -5,7 +5,7 @@
 /*
   Gold: dim_time
   --------------
-  Date/time dimension at hourly granularity covering 2024-01-01 to 2025-12-31.
+  Date/time dimension at hourly granularity covering 2024-01-01 to 2026-12-31.
   Generated via Spark SQL sequence() — no upstream data dependency.
 
   ~17,520 rows (2 years × 8,760 hours). Trivially fast even on a small cluster.
@@ -21,7 +21,7 @@ with hour_spine as (
   select explode(
     sequence(
       to_timestamp('2024-01-01 00:00:00'),
-      to_timestamp('2025-12-31 23:00:00'),
+      to_timestamp('2026-12-31 23:00:00'),
       interval 1 hour
     )
   ) as full_timestamp

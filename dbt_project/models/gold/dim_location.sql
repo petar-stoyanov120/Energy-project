@@ -16,8 +16,8 @@ with snapshot as (
 
   select *
   from {{ ref('snap_dim_location') }}
-  -- Filter to current versions only — dbt sets this flag automatically.
-  where dbt_is_current = true
+  -- Current records have dbt_valid_to IS NULL (open-ended validity).
+  where dbt_valid_to is null
 
 ),
 
@@ -37,7 +37,6 @@ final as (
     -- Expose SCD2 metadata for analysts who need historical context.
     dbt_valid_from,
     dbt_valid_to,
-    dbt_is_current,
     dbt_updated_at
 
   from snapshot
