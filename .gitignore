@@ -1,0 +1,88 @@
+# =============================================================================
+# Secrets & credentials — NEVER commit anything matching these patterns.
+# Patterns are intentionally broad and apply at every depth in the repo.
+# =============================================================================
+.env
+.env.*
+*.env
+.envrc
+**/profiles.yml
+**/secrets.json
+**/credentials.json
+**/credentials.yaml
+**/credentials.yml
+*secret*
+*credential*
+*creds*
+*token*
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+*.cer
+*.jks
+*.keystore
+.databrickscfg
+
+# =============================================================================
+# Python
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# =============================================================================
+# dbt artefacts (also covered by dbt_project/.gitignore but kept here as
+# defence in depth so a stray dbt project elsewhere stays clean too).
+# =============================================================================
+target/
+dbt_packages/
+logs/
+.dbt/
+
+# =============================================================================
+# Databricks / Spark local artefacts
+# =============================================================================
+.databricks/
+spark-warehouse/
+metastore_db/
+derby.log
+
+# =============================================================================
+# IDE & editor metadata
+# =============================================================================
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+.history/
+
+# =============================================================================
+# OS metadata
+# =============================================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =============================================================================
+# Local overrides & scratch files
+# =============================================================================
+*.local
+*.bak
+scratch/
+notes.local.md
