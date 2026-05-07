@@ -1,9 +1,13 @@
 # Weather & Energy Analytics Pipeline
 
-An end-to-end data engineering portfolio project that ingests real-time weather and
-carbon intensity data for 10 European capitals, processes it through a Medallion
-architecture (Bronze → Silver → Gold), and serves analytical insights via PostgreSQL
-and Metabase.
+An end-to-end data engineering project that ingests hourly weather forecasts and
+real-time energy data for ten European capitals, processes them through a Medallion
+architecture (Bronze → Silver → Gold) on Delta Lake, and serves the results to a
+local PostgreSQL database for visualisation in Metabase.
+
+The whole pipeline runs on **Databricks Free Edition serverless compute**, uses only
+**free, no-auth public APIs**, and stores everything as **Unity Catalog managed tables**
+under `main.weather_energy_dev.*`.
 
 ---
 
@@ -21,6 +25,7 @@ and Metabase.
 10. [Verification & Row Count Checks](#10-verification--row-count-checks)
 11. [Troubleshooting](#11-troubleshooting)
 12. [How to Extend the Project](#12-how-to-extend-the-project)
+13. [Project Constraints](#13-project-constraints)
 
 ---
 
@@ -28,33 +33,48 @@ and Metabase.
 
 ### What it does
 
-- **Ingests** hourly weather forecasts from [Open-Meteo](https://open-meteo.com/) (free, no auth)
-  and real-time carbon intensity from [Electricity Maps](https://electricitymaps.com/) (free tier)
-- **Processes** raw data through three Delta Lake layers: Bronze (raw) → Silver (cleaned) → Gold (star schema)
-- **Transforms** data using dbt Core with incremental models and SCD Type 2 dimensions
-- **Exports** Gold tables to PostgreSQL for BI analysis in Metabase
+- **Ingests** hourly weather forecasts from [Open-Meteo](https://open-meteo.com/) for
+  ten European capitals (no auth required).
+- **Ingests** real-time energy data from two free public sources:
+  the [UK Carbon Intensity API](https://carbonintensity.org.uk/) for Great Britain
+  (carbon intensity, generation mix) and [SMARD](https://www.smard.de/) for Germany
+  and Austria (day-ahead electricity price).
+- **Processes** raw API JSON through three Delta Lake layers — Bronze (raw,
+  schema-enforced), Silver (cleaned and deduplicated), Gold (a star schema fit for BI).
+- **Transforms** with dbt Core using incremental merge models, dbt snapshots for
+  SCD Type 2, and column-level data quality tests.
+- **Exports** the Gold layer to PostgreSQL so Metabase can connect to it without any
+  Databricks-specific drivers.
 
-### Cities covered
+### Cities & energy coverage
 
-| City | Country | Electricity Zone |
-|---|---|---|
-| London | GB | GB |
-| Berlin | DE | DE |
-| Paris | FR | FR |
-| Madrid | ES | ES |
-| Rome | IT | IT |
-| Amsterdam | NL | NL |
-| Warsaw | PL | PL |
-| Vienna | AT | AT |
-| Stockholm | SE | SE |
-| Lisbon | PT | PT |
+All ten cities are covered for **weather**. Energy data is available for the three
+cities whose national operators publish open data:
 
-### Key analytics enabled
+| City | Country | Weather | Energy source |
+|---|---|---|---|
+| London | GB | ✓ | UK Carbon Intensity API |
+| Berlin | DE | ✓ | SMARD (day-ahead price) |
+| Vienna | AT | ✓ | SMARD (day-ahead price) |
+| Paris | FR | ✓ | — (pending ENTSO-E access) |
+| Madrid | ES | ✓ | — (pending ENTSO-E access) |
+| Rome | IT | ✓ | — (pending ENTSO-E access) |
+| Amsterdam | NL | ✓ | — (pending ENTSO-E access) |
+| Warsaw | PL | ✓ | — (pending ENTSO-E access) |
+| Stockholm | SE | ✓ | — (pending ENTSO-E access) |
+| Lisbon | PT | ✓ | — (pending ENTSO-E access) |
 
-- Carbon intensity trends per city over time
-- Temperature vs. renewable energy percentage correlation
-- Daily weather summaries with energy profile classification
-- Weekend vs. weekday energy consumption patterns
+The fact table uses left joins, so cities without an energy row still appear with
+weather data and `NULL` energy columns. Once an ENTSO-E developer key is granted, the
+remaining seven zones can be added by extending `02_bronze_energy.py`.
+
+### Analytics enabled
+
+- Hourly carbon intensity trend for Great Britain.
+- Day-ahead electricity price trend for Germany and Austria.
+- Temperature vs. renewable percentage scatter plots (GB only, until ENTSO-E lands).
+- Daily weather rollups per city — average / min / max temperature, total precipitation.
+- Monthly weather-energy correlation report at city granularity.
 
 ---
 
@@ -64,55 +84,51 @@ and Metabase.
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         DATA SOURCES                                │
 │                                                                     │
-│  Open-Meteo API          Electricity Maps API                       │
-│  (no auth, free)         (free tier, API key)                       │
-│  hourly weather          carbon intensity / renewable %             │
-└──────────────┬───────────────────────┬──────────────────────────────┘
-               │                       │
-               ▼                       ▼
+│  Open-Meteo            UK Carbon Intensity         SMARD            │
+│  hourly weather        carbon intensity / mix      day-ahead price  │
+│  10 cities · no auth   GB · no auth                DE, AT · no auth │
+└──────────────┬─────────────────┬───────────────────────┬────────────┘
+               │                 │                       │
+               ▼                 ▼                       ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    BRONZE — Raw Ingestion                           │
+│                  BRONZE — Unity Catalog managed tables              │
 │                                                                     │
-│  01_bronze_weather.py        02_bronze_energy.py                    │
-│  PySpark + StructType        PySpark + StructType                   │
-│  Idempotent (replaceWhere)   Rate-limited (61s/zone)                │
+│  main.weather_energy_dev.bronze_weather                             │
+│  main.weather_energy_dev.bronze_energy                              │
+│    Both partitioned by (country, ingested_date)                     │
+│    StructType-enforced schemas · idempotent via replaceWhere        │
 │                                                                     │
-│  dbfs:/delta/bronze/weather/    dbfs:/delta/bronze/energy/          │
-│  partitioned by country, ingested_date                              │
-│                                                                     │
-│  Audit log → dbfs:/delta/logs/bronze_audit/                         │
+│  main.weather_energy_dev.bronze_audit       — per-city audit log   │
+│  main.weather_energy_dev.pipeline_run_log   — orchestrator runs    │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │  dbt run --select silver.*
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    SILVER — Cleaned & Deduplicated                  │
+│                  SILVER — cleaned, typed, deduplicated              │
 │                                                                     │
-│  stg_weather_hourly              stg_energy_intensity               │
-│  Incremental merge on weather_id  Incremental merge on energy_id    │
-│  QUALIFY deduplication           QUALIFY deduplication              │
-│  SHA-256 surrogate keys          SHA-256 surrogate keys             │
+│  stg_weather_hourly        stg_energy_intensity                     │
+│  Incremental merge on      Incremental merge on energy_id           │
+│  weather_id                QUALIFY-based deduplication              │
+│  SHA-256 surrogate keys    SHA-256 surrogate keys                   │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │  dbt snapshot + dbt run --select gold.*
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    GOLD — Star Schema                               │
+│                  GOLD — star schema                                 │
 │                                                                     │
-│  dim_location (SCD2)    dim_time       dim_weather_condition        │
-│  dim_weather_condition  (17,520 rows)  (WMO 4677 lookup)            │
+│  dim_location (SCD2)   dim_time      dim_weather_condition          │
+│  10 rows · current      ~17,520 rows  21 rows · WMO 4677 lookup     │
 │                                                                     │
-│  fact_energy_readings   agg_daily_energy   rpt_weather_energy_corr  │
-│  (grain: city × hour)   (grain: city × day) (grain: city × month)  │
+│  fact_energy_readings  agg_daily_energy   rpt_weather_energy_corr   │
+│  city × hour grain     city × day grain   city × month grain        │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │  python scripts/export_to_postgres.py
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    SERVING LAYER                                    │
+│                  SERVING LAYER                                      │
 │                                                                     │
-│  PostgreSQL (local)                                                 │
-│  Schema: weather_energy                                             │
-│                                                                     │
-│  Metabase (localhost:3000)                                          │
-│  Free open-source BI, connects directly to PostgreSQL               │
+│  PostgreSQL (local) · schema: weather_energy                        │
+│  Metabase OSS at localhost:3000 · connects directly to PostgreSQL   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -122,16 +138,17 @@ and Metabase.
 
 | Layer | Technology | Notes |
 |---|---|---|
-| Runtime | Databricks Free Edition | x2.small fixed cluster |
-| Compute | PySpark 3.x + Spark SQL | Available on Databricks Free |
-| Storage | Delta Lake on DBFS | `dbfs:/delta/` — no external mounts |
-| Transformation | dbt Core + dbt-databricks | Run locally via VS Code |
-| Weather API | Open-Meteo | Free, no auth required |
-| Energy API | Electricity Maps v3 | Free tier, API key required |
-| Serving DB | PostgreSQL (local) | Any version ≥ 12 |
-| BI | Metabase OSS (JAR) | Free, no Docker, `java -jar metabase.jar` |
-| IDE | VS Code + dbt Power User | dbt extension for IntelliSense |
-| Version control | GitHub | Connected to Databricks workspace |
+| Runtime | Databricks Free Edition | Serverless compute only — DBR 18.0, Python 3.12, Spark Connect |
+| Compute | PySpark (Spark Connect API) + Spark SQL | No `sparkContext`, no RDD APIs, no `df.cache()` |
+| Storage | Delta Lake (Unity Catalog managed tables) | Three-part names — `main.weather_energy_dev.*` |
+| Configuration | `dbutils.widgets` | Catalog and schema set at notebook runtime, never hardcoded |
+| Transformation | dbt Core + dbt-databricks | Run locally from VS Code against the SQL Warehouse |
+| Weather API | Open-Meteo | Free, no authentication |
+| Energy APIs | UK Carbon Intensity + SMARD | Both free, no authentication |
+| Serving DB | PostgreSQL 12+ | Local install |
+| BI | Metabase OSS (JAR) | Free, no Docker, runs as `java -jar metabase.jar` |
+| IDE | VS Code (+ dbt Power User extension) | dbt IntelliSense and lineage |
+| Version control | GitHub | Repo connected to the Databricks workspace |
 
 ---
 
@@ -139,87 +156,98 @@ and Metabase.
 
 ### Bronze layer
 
-Raw, schema-enforced Delta tables. Never modified after ingestion.
+Raw, schema-enforced Delta tables. Never modified after the initial write — only
+re-written via `replaceWhere` for the current ingested date.
 
 ```
-bronze_weather (partition: country, ingested_date)
+bronze_weather  (partition: country, ingested_date)
 ├── city, country, latitude, longitude, timezone
-├── hour (observation timestamp)
+├── hour                       — observation timestamp (UTC)
 ├── temperature_2m, windspeed_10m, weathercode, precipitation
 └── ingested_at, ingested_date, source
 
-bronze_energy (partition: country, ingested_date)
+bronze_energy   (partition: country, ingested_date)
 ├── zone, country, city
-├── carbon_intensity, fossil_free_pct, renewable_pct, measurement_at
+├── carbon_intensity           — gCO2eq/kWh, populated by UK API only
+├── fossil_free_pct            — 0–100, populated by UK API only
+├── renewable_pct              — 0–100, populated by UK API only
+├── day_ahead_price_eur_mwh    — €/MWh, populated by SMARD only (DE, AT)
+├── measurement_at             — original API timestamp
 └── ingested_at, ingested_date, source
 
-bronze_audit (unpartitioned — audit log)
+bronze_audit    (no partitioning — append-only log)
 └── source, city, row_count, ingested_at, status, error_message
+
+pipeline_run_log (no partitioning — orchestrator-level run tracking)
+└── run_id, started_at, ended_at, status, error
 ```
 
 ### Silver layer
 
-Cleaned, deduplicated, typed. Grain: one row per city per hour (weather) / zone per hour (energy).
+Cleaned, deduplicated, typed. Grain: one row per city per hour (weather) and one row
+per zone per measurement hour (energy). Both models are incremental and merge on a
+SHA-256 surrogate key.
 
 ```
 stg_weather_hourly
-├── weather_id (SHA-256 PK: city|observation_hour)
+├── weather_id              — SHA-256(city || observation_hour)
 ├── city, country, latitude, longitude, timezone
 ├── observation_hour, temperature_2m, windspeed_10m, weathercode, precipitation
 └── _source, _ingested_at, _loaded_at
 
 stg_energy_intensity
-├── energy_id (SHA-256 PK: zone|ingested_at)
+├── energy_id               — SHA-256(zone || ingested_at)
 ├── zone, country, city
-├── carbon_intensity_gco2eq, fossil_free_pct, renewable_pct, measurement_hour
+├── carbon_intensity_gco2eq, fossil_free_pct, renewable_pct
+├── day_ahead_price_eur_mwh, measurement_hour
 └── _source, _ingested_at, _loaded_at
 ```
 
-### Gold layer — Star Schema
+### Gold layer — star schema
 
 ```
-                    ┌─────────────────┐
-                    │  dim_location   │◄── SCD2 via snap_dim_location
-                    │  location_key   │
-                    │  city, country  │
-                    │  lat, lon, tz   │
+                    ┌──────────────────┐
+                    │  dim_location    │◄── SCD Type 2 via snap_dim_location
+                    │  location_key    │    (current rows only)
+                    │  city, country   │
+                    │  lat, lon, tz    │
                     │  electricity_zone│
-                    └────────┬────────┘
+                    └────────┬─────────┘
                              │
 ┌─────────────┐    ┌─────────▼───────────────┐    ┌──────────────────────┐
 │  dim_time   │◄───┤  fact_energy_readings   ├───►│ dim_weather_condition│
 │  time_key   │    │  fact_id (PK)           │    │  weathercode (PK)    │
 │  year/month │    │  location_key (FK)      │    │  condition_label     │
 │  day/hour   │    │  time_key (FK)          │    │  condition_category  │
-│  is_weekend │    │  weathercode_key (FK)   │    │  severity            │
+│  is_weekend │    │  weathercode (FK)       │    │  severity            │
 └─────────────┘    │  temperature_2m         │    └──────────────────────┘
                    │  windspeed_10m          │
                    │  precipitation          │
                    │  carbon_intensity       │
                    │  fossil_free_pct        │
                    │  renewable_pct          │
-                   └─────────────────────────┘
-                             │
-              ┌──────────────┴──────────────┐
-              │                             │
-    ┌─────────▼──────────┐    ┌─────────────▼──────────────┐
-    │  agg_daily_energy  │    │ rpt_weather_energy_corr    │
-    │  grain: city×day   │    │ grain: city×month          │
-    │  avg/max/min temp  │    │ avg_temp, avg_carbon_int   │
-    │  total precip      │    │ avg_renewable_pct          │
-    │  avg carbon/renew  │    │ temp_carbon_profile label  │
-    └────────────────────┘    └────────────────────────────┘
+                   │  day_ahead_price_eur_mwh│
+                   └────────────┬────────────┘
+                                │
+                ┌───────────────┴───────────────┐
+                │                               │
+      ┌─────────▼──────────┐    ┌───────────────▼────────────┐
+      │  agg_daily_energy  │    │ rpt_weather_energy_corr    │
+      │  grain: city×day   │    │ grain: city×month          │
+      │  avg/max/min temp  │    │ avg_temp, avg_carbon_int   │
+      │  total precip      │    │ avg_renewable_pct          │
+      │  avg carbon/renew  │    │ correlation profile        │
+      └────────────────────┘    └────────────────────────────┘
 ```
-
-**Dimension details:**
 
 | Dimension | Rows | Materialization | Notes |
 |---|---|---|---|
-| `dim_location` | 10 | table | SCD2 — current records only |
-| `dim_time` | ~17,520 | table | 2024–2025 at hourly grain |
-| `dim_weather_condition` | 21 | table | WMO 4677 static lookup |
+| `dim_location` | 10 | table | SCD2 — current rows only |
+| `dim_time` | ~17,520 | table | 2024–2025, hourly granularity |
+| `dim_weather_condition` | 21 | table | Static WMO 4677 code lookup |
 
-**Fact table grain:** one row per city per hour.
+`fact_energy_readings` is incremental with `merge` strategy on `fact_id`, so re-runs
+are safe and partial backfills are easy.
 
 ---
 
@@ -230,48 +258,47 @@ weather_energy_project/
 │
 ├── notebooks/                         # Databricks PySpark notebooks
 │   ├── 01_bronze_weather.py           # Open-Meteo ingestion (10 cities)
-│   ├── 02_bronze_energy.py            # Electricity Maps ingestion (10 zones, ~10 min)
-│   └── 03_orchestrator.py            # Sequenced runner with idempotency guard
+│   ├── 02_bronze_energy.py            # UK Carbon Intensity + SMARD ingestion
+│   └── 03_orchestrator.py             # Sequenced runner with idempotency guard
 │
 ├── dbt_project/                       # dbt Core project (run locally)
-│   ├── dbt_project.yml                # Project name, paths, materialization defaults
+│   ├── dbt_project.yml                # Project config and per-folder materializations
 │   ├── profiles.yml                   # LOCAL ONLY — Databricks connection (gitignored)
 │   ├── .gitignore                     # Excludes profiles.yml, target/, logs/
 │   ├── schema.yml                     # All sources, models, column-level tests
 │   │
 │   ├── seeds/
-│   │   └── regions.csv                # 10 European cities with lat/lon/timezone/zone
+│   │   └── regions.csv                # 10 European cities: lat / lon / timezone / zone
 │   │
 │   ├── models/
 │   │   ├── silver/
-│   │   │   ├── stg_weather_hourly.sql     # Incremental, deduplicated weather Silver
-│   │   │   └── stg_energy_intensity.sql   # Incremental, deduplicated energy Silver
+│   │   │   ├── stg_weather_hourly.sql
+│   │   │   └── stg_energy_intensity.sql
 │   │   └── gold/
-│   │       ├── dim_location.sql           # Current-state city dimension (from SCD2 snapshot)
-│   │       ├── dim_time.sql               # Hourly time spine 2024–2025
-│   │       ├── dim_weather_condition.sql  # WMO code lookup table
-│   │       ├── fact_energy_readings.sql   # Central fact, city × hour grain
-│   │       ├── agg_daily_energy.sql       # Daily rollup per city
-│   │       └── rpt_weather_energy_correlation.sql  # Monthly cross-domain report
+│   │       ├── dim_location.sql
+│   │       ├── dim_time.sql
+│   │       ├── dim_weather_condition.sql
+│   │       ├── fact_energy_readings.sql
+│   │       ├── agg_daily_energy.sql
+│   │       └── rpt_weather_energy_correlation.sql
 │   │
 │   ├── snapshots/
-│   │   └── snap_dim_location.sql      # SCD Type 2 on regions seed
+│   │   └── snap_dim_location.sql      # SCD Type 2 on the regions seed
 │   │
 │   └── tests/
-│       └── assert_bronze_not_empty.sql  # Singular test — fails if Bronze is empty
+│       └── assert_bronze_not_empty.sql  # Singular test — fails if Bronze has 0 rows
 │
 ├── scripts/
 │   └── export_to_postgres.py          # Reads Gold from Databricks, writes to PostgreSQL
 │
-├── .claude/
-│   └── rules/                         # Context rules for Claude Code sessions
-│       ├── error-handling.md
-│       ├── testing.md
-│       ├── api-design.md
-│       ├── security.md
-│       └── deployment.md
+├── .claude/rules/                     # Modular rules referenced by CLAUDE.md
+│   ├── error-handling.md
+│   ├── testing.md
+│   ├── api-design.md
+│   ├── security.md
+│   └── deployment.md
 │
-├── CLAUDE.md                          # Project instructions for Claude Code
+├── CLAUDE.md                          # Project conventions for Claude Code sessions
 └── README.md                          # This file
 ```
 
@@ -279,21 +306,23 @@ weather_energy_project/
 
 ## 6. Prerequisites & One-Time Setup
 
-### Required accounts (all free)
+### Required accounts (all free, no payment method needed)
 
-- [Databricks Free Edition](https://www.databricks.com/try-databricks) — sign up and create a workspace
-- [Electricity Maps](https://electricitymaps.com/free-tier-api) — register for a free API key
-- Open-Meteo — no registration needed
+- **[Databricks Free Edition](https://www.databricks.com/learn/free-edition)** —
+  sign up and create a workspace. Free Edition gives you a Unity Catalog metastore
+  and serverless compute out of the box.
+- **No API accounts required.** Open-Meteo, UK Carbon Intensity, and SMARD are all
+  open public APIs — no registration, no keys.
 
-### Required software (local machine)
+### Required local software
 
 | Software | Version | Purpose |
 |---|---|---|
-| Python | 3.9+ | Running dbt and export script |
-| Java | 11+ | Running Metabase JAR |
-| PostgreSQL | 12+ | Serving layer database |
+| Python | 3.9+ | Running dbt and the export script |
+| Java | 11+ | Running the Metabase JAR |
+| PostgreSQL | 12+ | Serving database |
 | Git | Any | Version control |
-| VS Code | Any | IDE with dbt extension |
+| VS Code | Any recent | IDE — optional but recommended |
 
 ### Install Python packages
 
@@ -301,176 +330,190 @@ weather_energy_project/
 pip install dbt-core dbt-databricks psycopg2-binary pandas requests databricks-cli
 ```
 
-### Create PostgreSQL database
+### Create the PostgreSQL database
 
 ```sql
--- Run in psql as a superuser (e.g. postgres user)
+-- Run once in psql as a superuser (e.g. the postgres role)
 CREATE DATABASE weather_energy_db;
 \c weather_energy_db
 CREATE SCHEMA weather_energy;
 ```
 
-### Create Databricks secret scope
+### Create the Unity Catalog schema in Databricks
 
-The secret scope must be created in Databricks before running any notebook.
+The pipeline writes to `main.weather_energy_dev.*`. Create the schema once before the
+first run, either in the Databricks SQL editor or in a notebook cell:
 
-**Step 1 — Open the secret scope creation URL in your browser:**
+```sql
+CREATE SCHEMA IF NOT EXISTS main.weather_energy_dev;
 ```
-https://<your-workspace-host>/#secrets/createScope
-```
 
-**Step 2 — Configure:**
-- Scope name: `weather_energy`
-- Manage principal: `Creator` (required on Free Edition — Azure Key Vault not available)
-
-**Step 3 — Add the Electricity Maps API key via CLI:**
-```bash
-# Configure the CLI with your workspace URL and personal access token
-databricks configure --token
-
-# Add the secret (you'll be prompted to paste the key — it won't be visible)
-databricks secrets put --scope weather_energy --key electricity_maps_key
-```
+Free Edition workspaces are provisioned with the `main` catalog enabled, so no extra
+permissions setup is needed.
 
 ### Get your Databricks personal access token
 
-1. Click your avatar (top right) in the Databricks workspace
-2. Settings → Developer → Access tokens → Generate new token
-3. Copy the `dapiXXX...` value — you'll need it for `profiles.yml`
+1. Click your avatar (top right of the Databricks workspace) → **Settings**.
+2. **Developer** → **Access tokens** → **Generate new token**.
+3. Copy the `dapi…` value — you'll paste it into `profiles.yml` shortly.
 
-### Get your Databricks HTTP path
+### Get your SQL Warehouse connection details
 
-1. SQL Warehouses (left sidebar) → click your warehouse
-2. "Connection details" tab
-3. Copy "Server hostname" and "HTTP path"
+1. **SQL Warehouses** in the left sidebar → click your warehouse.
+2. Open the **Connection details** tab.
+3. Copy **Server hostname** and **HTTP path**.
+
+> Free Edition starts a small Serverless SQL Warehouse for you automatically. You don't
+> need to create one yourself.
 
 ---
 
 ## 7. Step-by-Step Setup Guide
 
-Follow these steps in order. Each phase must complete before the next begins.
+Each phase must complete before the next begins.
 
-### Phase 1: dbt scaffold (local)
+### Phase 1 — Configure dbt locally
 
 ```bash
-# From the project root
 cd dbt_project
-
-# Edit profiles.yml with your real Databricks credentials (never commit this file)
-# Replace <YOUR_WORKSPACE_HOST>, <YOUR_HTTP_PATH>, <YOUR_PERSONAL_ACCESS_TOKEN>
-
-# Verify the connection to Databricks
-dbt debug
-
-# Load the regions seed (creates the regions table in Databricks)
-dbt seed
 ```
 
-Expected output from `dbt debug`: all checks pass, connection to Databricks confirmed.
+Create `dbt_project/profiles.yml` (this file is gitignored — never commit real
+credentials):
 
-### Phase 2: Bronze ingestion (Databricks)
+```yaml
+weather_energy:
+  target: dev
+  outputs:
+    dev:
+      type: databricks
+      host: <YOUR_SERVER_HOSTNAME>          # e.g. dbc-12345.cloud.databricks.com
+      http_path: <YOUR_SQL_WAREHOUSE_HTTP_PATH>
+      token: <YOUR_PERSONAL_ACCESS_TOKEN>
+      catalog: main
+      schema: weather_energy_dev
+      threads: 2
+```
 
-Import the three notebooks into Databricks from GitHub, or create them manually:
+Verify the connection and load the seed:
 
-1. Open `notebooks/01_bronze_weather.py` in Databricks → **Run All**
-   - Verify: `dbfs:/delta/bronze/weather/` exists with data
-   - Verify: `default.bronze_weather` appears in Hive Metastore
+```bash
+dbt debug          # all checks should pass
+dbt seed           # creates main.weather_energy_dev.regions
+```
 
-2. Open `notebooks/02_bronze_energy.py` in Databricks → **Run All**
-   - This takes ~10 minutes due to API rate limiting — this is expected
-   - Verify: `dbfs:/delta/bronze/energy/` exists with 10 rows
-   - Verify: `default.bronze_energy` appears in Hive Metastore
+### Phase 2 — Bronze ingestion (Databricks)
 
-3. Check the audit log in Databricks:
-   ```sql
-   SELECT * FROM delta.`dbfs:/delta/logs/bronze_audit` ORDER BY ingested_at DESC LIMIT 20
-   ```
+Import the three notebooks in `notebooks/` into your Databricks workspace (you can
+clone the GitHub repo into the workspace's Repos area or upload the files manually).
 
-### Phase 3: Silver models (local dbt)
+Each notebook exposes two text widgets — `catalog` and `schema` — at the top of the
+notebook. Both default to `main` and `weather_energy_dev`, so you can usually just
+click **Run All**.
+
+1. Open `01_bronze_weather.py` → **Run All**.
+   - Verify `main.weather_energy_dev.bronze_weather` is populated.
+2. Open `02_bronze_energy.py` → **Run All**.
+   - Runtime is roughly 30–60 seconds — both energy APIs are fast and unrate-limited.
+   - Verify `main.weather_energy_dev.bronze_energy` has three rows (London, Berlin, Vienna).
+3. Inspect the audit log:
+
+```sql
+SELECT * FROM main.weather_energy_dev.bronze_audit
+ORDER BY ingested_at DESC LIMIT 20;
+```
+
+### Phase 3 — Silver models (local dbt)
 
 ```bash
 cd dbt_project
 
-# Check Bronze tables are non-empty before running Silver
+# Confirm Bronze has data before running anything downstream
 dbt test --select assert_bronze_not_empty
 
-# Run Silver models
-dbt run --select silver.*
-
-# Test Silver
+dbt run  --select silver.*
 dbt test --select silver.*
 ```
 
-All tests should pass. Key assertions: `weather_id` and `energy_id` are unique and not null.
+All Silver tests should pass. The key contracts are `weather_id` and `energy_id`
+being unique and not null.
 
-### Phase 4: Gold models (local dbt)
+### Phase 4 — Gold models (local dbt)
 
 ```bash
-cd dbt_project
-
-# SCD2 snapshot must run before dim_location
+# The SCD2 snapshot must run before dim_location reads from it
 dbt snapshot
 
-# Run all Gold models in dependency order (dbt resolves this automatically)
-dbt run --select gold.*
-
-# Test Gold
+dbt run  --select gold.*
 dbt test --select gold.*
 ```
 
-### Phase 5: Export to PostgreSQL (local)
+dbt resolves the dependency order automatically — dimensions before fact, fact before
+the aggregates and the report.
+
+### Phase 5 — Export to PostgreSQL
 
 ```bash
-# Set your PostgreSQL password as an environment variable
+# Set the PostgreSQL password as an environment variable (don't commit a .env file)
 export PG_PASSWORD=your_postgres_password
 
-# Run the export script
+# On Windows PowerShell:
+# $env:PG_PASSWORD = "your_postgres_password"
+
 python scripts/export_to_postgres.py
 ```
 
-### Phase 6: Set up Metabase
+The script truncates and reloads each Gold table on every run, so it's safe to call
+repeatedly.
+
+### Phase 6 — Set up Metabase
 
 ```bash
-# Download Metabase from https://www.metabase.com/start/oss/
-# Requires Java 11+ (check: java -version)
+# 1. Download the OSS JAR from https://www.metabase.com/start/oss/
+# 2. Java 11+ required (check: java -version)
 java -jar metabase.jar
 ```
 
-Then open `http://localhost:3000` and follow the setup wizard:
-- Database type: PostgreSQL
-- Host: `localhost` | Port: `5432`
-- Database name: `weather_energy_db`
-- Username: `postgres` | Password: your PG_PASSWORD
-- Schema: `weather_energy`
+Open `http://localhost:3000` and complete the wizard:
+
+- **Database type:** PostgreSQL
+- **Host / Port:** `localhost` / `5432`
+- **Database name:** `weather_energy_db`
+- **Username / Password:** `postgres` / your `PG_PASSWORD`
+- **Schema:** `weather_energy`
 
 ---
 
 ## 8. Running the Pipeline
 
-### Development (step by step)
+### Manual run (development)
 
-Run each notebook and dbt command individually as described in the setup guide.
+Run the notebooks individually as in Phase 2 above, then run dbt and the export
+locally as in Phases 3–5.
 
-### Automated (orchestrator)
+### Automated run (orchestrator)
 
-For a single-command full Bronze run, use the orchestrator notebook in Databricks:
+For a single-click full Bronze refresh, use `03_orchestrator.py` in Databricks:
 
-1. Open `03_orchestrator.py` in Databricks
-2. Click "Run All"
-3. The orchestrator will:
-   - Check the idempotency guard (refuses to run if already RUNNING)
-   - Run `01_bronze_weather` (weather notebook)
-   - Run `02_bronze_energy` (energy notebook, ~10 min)
-   - Log the run result to `dbfs:/delta/logs/pipeline_runs/`
+1. Open `03_orchestrator.py` and click **Run All**.
+2. The orchestrator:
+   - Looks at `main.weather_energy_dev.pipeline_run_log` and refuses to start if a
+     run started in the last two hours is still in `RUNNING` state — this prevents
+     accidental double-triggers from corrupting Bronze.
+   - Writes a new `RUNNING` row to the log.
+   - Calls `01_bronze_weather` via `%run` (Free Edition serverless does not support
+     `dbutils.notebook.run`).
+   - Calls `02_bronze_energy` via `%run`.
+   - Updates the log row to `SUCCESS` (or `FAILED` with the error).
 
-After the orchestrator completes, run dbt and export locally:
+After the orchestrator finishes, run the dbt commands and export script locally:
 
 ```bash
 cd dbt_project
 dbt test --select assert_bronze_not_empty
-dbt run --select silver.*  && dbt test --select silver.*
+dbt run  --select silver.*  && dbt test --select silver.*
 dbt snapshot
-dbt run --select gold.*    && dbt test --select gold.*
+dbt run  --select gold.*    && dbt test --select gold.*
 cd ..
 export PG_PASSWORD=your_password
 python scripts/export_to_postgres.py
@@ -480,50 +523,45 @@ python scripts/export_to_postgres.py
 
 ## 9. Common Commands
 
-### Pipeline
-
-```bash
-# Full Bronze run via orchestrator (Databricks UI)
-# → Run All on 03_orchestrator.py
-```
-
-### dbt (run from dbt_project/ directory)
+### dbt (run from `dbt_project/`)
 
 ```bash
 dbt debug                                 # Verify Databricks connection
 dbt seed                                  # (Re)load regions.csv
-dbt snapshot                              # Refresh SCD2 dim_location
-dbt run --select silver.*                 # Run Silver models
-dbt run --select gold.*                   # Run Gold models
-dbt run --select silver.* gold.*          # Run Silver + Gold in one command
-dbt test --select silver.* gold.*         # Run all tests
-dbt test --select assert_bronze_not_empty # Check Bronze is non-empty
-dbt run --full-refresh --select silver.*  # Full rebuild of Silver (dev only)
-dbt docs generate && dbt docs serve       # Generate and browse dbt documentation
+dbt snapshot                              # Refresh SCD2 snap_dim_location
+dbt run  --select silver.*                # Run Silver models
+dbt run  --select gold.*                  # Run Gold models
+dbt run  --select silver.* gold.*         # Both layers in one go
+dbt test --select silver.* gold.*         # All column-level tests
+dbt test --select assert_bronze_not_empty # Singular Bronze sanity check
+dbt run  --full-refresh --select silver.* # Rebuild Silver from scratch (dev only)
+dbt docs generate && dbt docs serve       # Browse model lineage and docs
 ```
 
-### Validation
+### Validation queries (run in Databricks SQL)
 
 ```sql
 -- Audit log: last 20 ingestion events
-SELECT * FROM delta.`dbfs:/delta/logs/bronze_audit` ORDER BY ingested_at DESC LIMIT 20;
+SELECT *
+FROM main.weather_energy_dev.bronze_audit
+ORDER BY ingested_at DESC
+LIMIT 20;
 
--- Bronze row counts
--- (run in a Databricks notebook cell)
--- spark.read.format("delta").load("dbfs:/delta/bronze/weather").count()
--- spark.read.format("delta").load("dbfs:/delta/bronze/energy").count()
+-- Orchestrator runs
+SELECT *
+FROM main.weather_energy_dev.pipeline_run_log
+ORDER BY started_at DESC
+LIMIT 10;
 
--- Silver row counts (Databricks SQL)
-SELECT COUNT(*) FROM weather_energy_dev.stg_weather_hourly;
-SELECT COUNT(*) FROM weather_energy_dev.stg_energy_intensity;
-
--- Gold row counts
-SELECT COUNT(*) FROM weather_energy_dev.fact_energy_readings;
-SELECT COUNT(*) FROM weather_energy_dev.dim_time;
-SELECT COUNT(*) FROM weather_energy_dev.dim_location;
+-- Row counts across the three layers
+SELECT 'bronze_weather'  AS layer, COUNT(*) AS rows FROM main.weather_energy_dev.bronze_weather
+UNION ALL SELECT 'bronze_energy',  COUNT(*) FROM main.weather_energy_dev.bronze_energy
+UNION ALL SELECT 'stg_weather_hourly',   COUNT(*) FROM main.weather_energy_dev.stg_weather_hourly
+UNION ALL SELECT 'stg_energy_intensity', COUNT(*) FROM main.weather_energy_dev.stg_energy_intensity
+UNION ALL SELECT 'fact_energy_readings', COUNT(*) FROM main.weather_energy_dev.fact_energy_readings;
 ```
 
-### Export
+### Export to PostgreSQL
 
 ```bash
 export PG_PASSWORD=your_password
@@ -532,106 +570,96 @@ python scripts/export_to_postgres.py
 
 ### Maintenance
 
-```bash
-# Restart Databricks cluster to clear Spark cache
-# → Compute → your cluster → Restart
+```sql
+-- Clear today's Bronze partition (rare — only when reproducing a bug)
+DELETE FROM main.weather_energy_dev.bronze_weather
+WHERE ingested_date = CURRENT_DATE;
 
-# Clear Bronze (requires explicit confirmation — destructive)
-# → In a Databricks notebook:
-# spark.sql("DELETE FROM delta.`dbfs:/delta/bronze/weather`")
+-- Inspect Delta history before any destructive change
+DESCRIBE HISTORY main.weather_energy_dev.fact_energy_readings;
 ```
 
 ---
 
 ## 10. Verification & Row Count Checks
 
-After a successful full run, verify these row counts:
+After a clean full run, expect roughly these counts:
 
-| Table | Expected | Notes |
+| Table | Per run | Notes |
 |---|---|---|
-| `bronze_weather` | ~240 | 10 cities × 24 hours |
-| `bronze_energy` | 10 | 1 per zone per run |
-| `stg_weather_hourly` | ~240 (cumulative) | Grows with each run |
-| `stg_energy_intensity` | ~10 (cumulative) | Grows with each run |
-| `dim_time` | 17,520 | 2024–2025, hourly |
-| `dim_location` | 10 | One per city (current only) |
-| `dim_weather_condition` | 21 | Static WMO codes |
-| `fact_energy_readings` | ~240 per run | Incremental merge |
-| `agg_daily_energy` | 10 per day | 10 cities |
-| `rpt_weather_energy_correlation` | 10 per month | 10 cities |
+| `bronze_weather` | ~240 | 10 cities × 24 hours of forecast |
+| `bronze_energy` | 3 | London, Berlin, Vienna |
+| `stg_weather_hourly` | ~240 (cumulative) | Grows over time as runs accumulate |
+| `stg_energy_intensity` | ~3 (cumulative) | Grows over time |
+| `dim_time` | 17,520 | Static — 2024-01-01 to 2025-12-31 hourly |
+| `dim_location` | 10 | Current SCD2 rows only |
+| `dim_weather_condition` | 21 | Static WMO 4677 lookup |
+| `fact_energy_readings` | ~240 (per run) | Incremental merge on `fact_id` |
+| `agg_daily_energy` | ~10 per day | One row per city per day |
+| `rpt_weather_energy_correlation` | ~10 per month | One row per city per month |
 
 ---
 
 ## 11. Troubleshooting
 
-### `dbfs:/delta/` write permission denied
+### `dbt debug` fails
 
-Databricks Free Edition may restrict writes to some DBFS paths.
+1. Confirm the SQL Warehouse is **running** in Databricks — Free Edition warehouses
+   auto-terminate after idle.
+2. The `host` value in `profiles.yml` must not include `https://` — just the hostname.
+3. The `http_path` must start with `/sql/1.0/warehouses/`.
+4. If the access token has expired, regenerate it under **Settings → Developer → Access tokens**.
 
-**Fix A — Use managed volumes (Unity Catalog):**
-In each notebook, change the path constant:
-```python
-BRONZE_WEATHER_PATH = "/Volumes/main/weather_energy/bronze/weather"
-```
-Create the volume first in Databricks UI: Catalog → Create Volume.
+### Notebook fails with "Spark Connect does not support sparkContext"
 
-**Fix B — Use managed tables (no explicit path):**
-```python
-df.write.format("delta").mode("overwrite").saveAsTable("default.bronze_weather_raw")
-```
-Then remove the LOCATION clause from the `register_hive_table()` call.
+Free Edition serverless uses Spark Connect, which exposes a subset of the PySpark API.
+Avoid:
 
-### `QUALIFY` not supported (older Spark version)
+- `spark.sparkContext` and any RDD-level operations
+- `df.cache()` / `df.persist()`
+- `dbutils.notebook.run()` — use `%run ./other_notebook` instead
 
-If your cluster uses Spark < 3.3, replace `qualify row_num = 1` with a subquery:
+If you've extended the codebase and hit this error, search the offending notebook for
+those calls and rewrite them with DataFrame-only APIs.
 
-```sql
-select * from (
-  select *, row_number() over (...) as row_num
-  from source
-) where row_num = 1
-```
+### Bronze tables not visible to dbt
 
-### dbt connection error (`dbt debug` fails)
-
-1. Verify the Databricks SQL Warehouse is **running** (not terminated)
-2. Check `profiles.yml` — ensure `host` has no `https://` prefix
-3. Ensure `http_path` starts with `/sql/1.0/warehouses/`
-4. Regenerate your personal access token if it has expired
-
-### Electricity Maps returns 401 Unauthorized
-
-The API key in the Databricks secret scope may be incorrect or expired.
-
-```bash
-# Update the secret
-databricks secrets put --scope weather_energy --key electricity_maps_key
-```
-
-### Bronze tables not visible to dbt sources
-
-The notebooks must have run successfully and registered the Hive Metastore tables.
-Check in Databricks SQL:
+Check that the writes actually landed:
 
 ```sql
-SHOW TABLES IN default;
--- Should show: bronze_weather, bronze_energy
+SHOW TABLES IN main.weather_energy_dev;
 ```
 
-If missing, re-run the Bronze notebooks — they call `CREATE TABLE IF NOT EXISTS` at the end.
+You should see at least `bronze_weather`, `bronze_energy`, `bronze_audit`, and (after
+the orchestrator has run) `pipeline_run_log`. If they're missing, re-run the Bronze
+notebooks and inspect the `bronze_audit` table for `FAILED` rows.
 
-### PostgreSQL export fails: `PG_PASSWORD not set`
+### Orchestrator refuses to run with "A pipeline run is already in RUNNING status"
+
+A previous run crashed before it could mark itself as `SUCCESS` or `FAILED`. The guard
+window is two hours — either wait it out, or manually update the row:
+
+```sql
+UPDATE main.weather_energy_dev.pipeline_run_log
+SET status = 'FAILED', error = 'Manually cleared'
+WHERE run_id = '<the_run_id>';
+```
+
+### PostgreSQL export fails: `PG_PASSWORD environment variable is not set`
+
+The export script reads the password from the environment to avoid hardcoding it:
 
 ```bash
-export PG_PASSWORD=your_password
+export PG_PASSWORD=your_password           # macOS / Linux
+$env:PG_PASSWORD = "your_password"         # Windows PowerShell
 python scripts/export_to_postgres.py
 ```
 
 ### Metabase can't connect to PostgreSQL
 
-- Ensure PostgreSQL is running: `pg_ctl status` or check Windows Services
-- Use `localhost` not `127.0.0.1` in Metabase connection settings
-- Confirm the schema `weather_energy` exists in `weather_energy_db`
+- Make sure PostgreSQL is running (`pg_ctl status`, or check Windows Services).
+- Use `localhost` rather than `127.0.0.1` in the Metabase form.
+- Confirm the schema `weather_energy` actually exists in `weather_energy_db`.
 
 ---
 
@@ -639,58 +667,78 @@ python scripts/export_to_postgres.py
 
 ### Add a new city
 
-1. Add a row to `dbt_project/seeds/regions.csv` with city, country, lat, lon, timezone, zone
-2. Add the city to the `CITIES` list in `notebooks/01_bronze_weather.py`
-3. Add the zone to the `ZONES` list in `notebooks/02_bronze_energy.py`
-4. Run `dbt seed` to reload the seed table
-5. Run `dbt snapshot` to create a new SCD2 record for the city
-6. Re-run the full pipeline
+1. Add a row to `dbt_project/seeds/regions.csv` with `city`, `country`, `lat`, `lon`,
+   `timezone`, and `zone`.
+2. Add the city to the `CITIES` list in `notebooks/01_bronze_weather.py`.
+3. If energy data is available for that zone, add a fetch block to
+   `notebooks/02_bronze_energy.py`.
+4. `dbt seed` to reload the seed table.
+5. `dbt snapshot` to record the new city in the SCD2 history.
+6. Re-run the full pipeline.
 
-### Add a new API data source
+### Add a new energy source
 
-1. Create `notebooks/0N_bronze_<source>.py` following the same pattern as `01_bronze_weather.py`
-2. Add a secret key to the `weather_energy` scope if needed
-3. Add the new source table to `schema.yml` under `sources`
-4. Create `dbt_project/models/silver/stg_<source>.sql`
-5. Update `03_orchestrator.py` to include the new notebook
-6. Update `CLAUDE.md` Section 2 and Section 7
-7. Update this README
+1. Create a new fetcher inside `02_bronze_energy.py` (or a new
+   `0N_bronze_<source>.py` notebook for a fully separate source).
+2. Map its fields onto the existing `ENERGY_SCHEMA` — leave columns null where the
+   new source doesn't provide them.
+3. Add the source to `schema.yml` if it's a new Bronze table.
+4. Update `03_orchestrator.py` so the new notebook is `%run` in sequence.
+5. Update Section 1 (the cities table) and Section 7 of this README.
 
 ### Add a new Gold report
 
-1. Create `dbt_project/models/gold/rpt_<name>.sql`
-2. Add the model to `schema.yml` with at least `not_null` tests on key columns
-3. Run `dbt run --select gold.rpt_<name>` and `dbt test --select gold.rpt_<name>`
-4. The export script automatically picks up any new table in `GOLD_TABLES` list —
-   add the table name to `GOLD_TABLES` in `scripts/export_to_postgres.py`
+1. Create `dbt_project/models/gold/rpt_<name>.sql`.
+2. Add the model to `schema.yml` with at least `not_null` tests on key columns.
+3. `dbt run --select gold.rpt_<name>` and `dbt test --select gold.rpt_<name>`.
+4. Append the new table name to `GOLD_TABLES` in
+   `scripts/export_to_postgres.py` so it ships to PostgreSQL.
 
-### Extend the time range
+### Extend the time dimension range
 
-Change the `sequence()` end timestamp in `dbt_project/models/gold/dim_time.sql`:
+`dbt_project/models/gold/dim_time.sql` builds the spine with `sequence()` between two
+fixed timestamps. To extend through 2026:
 
 ```sql
 sequence(
   to_timestamp('2024-01-01 00:00:00'),
-  to_timestamp('2026-12-31 23:00:00'),  -- extended to end of 2026
+  to_timestamp('2026-12-31 23:00:00'),
   interval 1 hour
 )
 ```
 
-Then run `dbt run --select dim_time`.
+Then `dbt run --select dim_time`.
 
 ---
 
-## Constraints (what this pipeline must never do)
+## 13. Project Constraints
 
-- Hardcode API keys, tokens, or passwords — always use `dbutils.secrets`
-- Use `/mnt/` paths — always use `dbfs:/delta/` (or managed volumes as fallback)
-- Mount external storage (Azure ADLS, S3) — not supported on Databricks Free Edition
-- Call Electricity Maps API faster than 1 request/minute (free tier rate limit)
-- Skip deduplication in Silver models
-- Run Gold without first verifying Silver tests pass
-- Commit `profiles.yml` or any file containing real credentials to GitHub
+The pipeline deliberately enforces these rules. They're worth keeping in mind before
+extending the codebase:
+
+- **No hardcoded secrets.** Catalog and schema come from `dbutils.widgets`. Any future
+  API key must come from `dbutils.secrets.get(scope="weather_energy", key=...)` —
+  never from environment variables in a notebook, never from the source.
+- **Unity Catalog only.** All tables use three-part names (`main.weather_energy_dev.*`)
+  via `saveAsTable`. No `dbfs:/delta/` paths. No `CREATE TABLE … LOCATION`.
+- **Serverless-friendly PySpark only.** No `sparkContext`, no RDD APIs, no
+  `df.cache()`, no `dbutils.notebook.run()`. Free Edition serverless will reject all
+  of those at runtime.
+- **No external storage mounts.** ADLS, S3, GCS mounts are not supported on Free
+  Edition.
+- **Idempotency.** Bronze writes use `replaceWhere` on the current `ingested_date`
+  partition, so re-running the same day overwrites cleanly without duplicating rows.
+  The orchestrator's run-log guard prevents two concurrent runs.
+- **Schema enforcement on Bronze.** Every `createDataFrame` call passes an explicit
+  `StructType`. If an upstream API changes shape, the write fails fast rather than
+  silently corrupting downstream models.
+- **Every dbt model has tests.** At minimum, surrogate keys carry `not_null` and
+  `unique` tests, defined alongside the model in `schema.yml`.
+- **No commercial APIs.** The whole pipeline runs end-to-end on free, public,
+  unauthenticated data sources. No payment method or paid tier required.
 
 ---
 
-*Built as a data engineering portfolio project demonstrating Medallion architecture,
-PySpark, dbt Core, SCD Type 2, incremental models, and cross-domain analytics.*
+*Built as a portfolio data engineering project — Medallion architecture, PySpark on
+serverless Databricks, dbt Core, SCD Type 2, incremental merges, and a star-schema
+Gold layer feeding a local PostgreSQL + Metabase BI stack.*
